@@ -8,10 +8,14 @@
    - 同键异字节 -> 409 拒绝，记录不可改；
    - 超累计上限 -> 409 拒绝；
 3. 每次发布追加一个检查点（条数 + Merkle 根），只增不改；
-4. 下载与证明只服务已提交记录；启动自检发现缺件则健康检查置为不可用。
+4. 下载与证明只服务已提交记录；启动自检发现缺件则健康检查置为不可用；
+5. 负荷核算按发布单读取两份原件，校验/核算/保存任一步失败均保留旧结果，
+   重算以 expected_id 做乐观并发控制，现行编号已变即 409。
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from contextlib import asynccontextmanager
 from datetime import date
@@ -20,15 +24,18 @@ from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import merkle
+from . import loadcalc, merkle
 from .config import settings
-from .db import ConflictError, Database
+from .db import ConflictError, Database, StaleRevisionError
 from .schemas import (
     AppendProofOut,
     CheckpointOut,
     HealthOut,
     InclusionProofOut,
     LeafRecordOut,
+    LoadComputeRequest,
+    LoadResultOut,
+    LoadResultRevisionOut,
     PublishResult,
     ReleaseOut,
 )
@@ -49,11 +56,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="河流水质站日 CSV 发布服务",
-    version="1.0.0",
+    title="河流水质站日 CSV 发布与负荷核算服务",
+    version="1.1.0",
     description=(
-        "不可改的原件发布、SHA-256 Merkle 检查点、单件纳入证明与检查点追加证明。"
-        "原件字节存共享卷，数据库只存目录与摘要。"
+        "不可改的原件发布、SHA-256 Merkle 检查点、单件纳入证明与检查点追加证明；"
+        "按发布单读取流量/总磷浓度两份原件，核算整点小时与全日可达到的负荷上下界。"
+        "原件字节存共享卷，数据库只存目录、摘要与核算结果。"
     ),
     lifespan=lifespan,
 )
@@ -286,6 +294,180 @@ async def append_proof(old_seq: int):
         tree_depth=settings.tree_depth,
         entries=entries,
     )
+
+
+# --------------------------------------------------------------------------- #
+# 负荷核算
+# --------------------------------------------------------------------------- #
+def _load_result_out(record: dict, is_current: bool | None = None):
+    payload = {
+        "id": record["id"],
+        "station_id": record["station_id"],
+        "sample_date": record["sample_date"],
+        "flow_order_no": record["flow_order_no"],
+        "conc_order_no": record["conc_order_no"],
+        "flow_blob_sha256": record["flow_blob_sha256"],
+        "conc_blob_sha256": record["conc_blob_sha256"],
+        "hours": json.loads(record["hourly_json"]),
+        "day": json.loads(record["daily_json"]),
+        "created_at": record["created_at"],
+    }
+    if is_current is None:
+        return LoadResultOut(**payload)
+    return LoadResultRevisionOut(**payload, is_current=is_current)
+
+
+def _load_release_or_404(station_id: str, sample_date: str, order_no: str, role: str):
+    record = database.get_release(station_id, sample_date, order_no)
+    if record is None:
+        raise HTTPException(
+            404,
+            detail={
+                "message": f"{role}原件未发布，无法核算",
+                "station_id": station_id,
+                "sample_date": sample_date,
+                "order_no": order_no,
+            },
+        )
+    return record
+
+
+@app.post(
+    "/load-results",
+    response_model=LoadResultOut,
+    status_code=201,
+    summary="按发布单核算负荷上下界（首次留空 expected_id，重算携带现行编号）",
+)
+async def compute_load_result(payload: LoadComputeRequest):
+    _require_healthy()
+    _validate_identity(
+        payload.station_id, payload.sample_date, payload.flow_order_no
+    )
+    if not _ORDER_RE.match(payload.conc_order_no or ""):
+        raise HTTPException(422, "conc_order_no 须为 1-128 位字母数字及 ._- 字符")
+
+    # 1) 定位两份已发布原件（只读，失败在任何写入之前 -> 旧结果自然保留）。
+    flow_rel = await run_in_threadpool(
+        _load_release_or_404,
+        payload.station_id,
+        payload.sample_date,
+        payload.flow_order_no,
+        "流量",
+    )
+    conc_rel = await run_in_threadpool(
+        _load_release_or_404,
+        payload.station_id,
+        payload.sample_date,
+        payload.conc_order_no,
+        "浓度",
+    )
+
+    # 2) 从共享卷读取原件字节并复核摘要；读盘/校验/核算失败均不触库。
+    try:
+        flow_bytes = await run_in_threadpool(blob_store.read, flow_rel["blob_sha256"])
+        conc_bytes = await run_in_threadpool(blob_store.read, conc_rel["blob_sha256"])
+    except OSError as exc:
+        raise HTTPException(
+            503, detail={"message": f"原件读取失败，保留旧结果: {exc}"}
+        )
+
+    if hashlib.sha256(flow_bytes).hexdigest() != flow_rel["blob_sha256"]:
+        raise HTTPException(503, detail={"message": "流量原件摘要不符，拒绝核算"})
+    if hashlib.sha256(conc_bytes).hexdigest() != conc_rel["blob_sha256"]:
+        raise HTTPException(503, detail={"message": "浓度原件摘要不符，拒绝核算"})
+
+    try:
+        flow_segments, conc_segments = await run_in_threadpool(
+            loadcalc.parse_and_validate, flow_bytes, conc_bytes
+        )
+        report = await run_in_threadpool(
+            loadcalc.compute_report,
+            payload.station_id,
+            payload.sample_date,
+            payload.flow_order_no,
+            payload.conc_order_no,
+            flow_rel["blob_sha256"],
+            conc_rel["blob_sha256"],
+            flow_segments,
+            conc_segments,
+        )
+    except loadcalc.LoadCalcError as exc:
+        # 问题时段逐条回传，请求被拒绝，不产生任何新版本。
+        raise HTTPException(
+            422,
+            detail={
+                "message": exc.message,
+                "problems": exc.problems,
+                "flow_order_no": payload.flow_order_no,
+                "conc_order_no": payload.conc_order_no,
+            },
+        )
+
+    # 3) 串行化保存 + 乐观并发：现行编号已变 -> 409，旧结果保留。
+    try:
+        record = await run_in_threadpool(
+            database.save_load_result,
+            payload.station_id,
+            payload.sample_date,
+            payload.flow_order_no,
+            payload.conc_order_no,
+            flow_rel["blob_sha256"],
+            conc_rel["blob_sha256"],
+            report.hours,
+            report.day,
+            payload.expected_id,
+        )
+    except StaleRevisionError as exc:
+        current = await run_in_threadpool(
+            database.get_current_load_result, payload.station_id, payload.sample_date
+        )
+        raise HTTPException(
+            409,
+            detail={
+                "message": str(exc),
+                "current_id": current["id"] if current else None,
+            },
+        )
+    return _load_result_out(record)
+
+
+@app.get(
+    "/load-results",
+    response_model=list[LoadResultOut],
+    summary="列出各站日现行负荷结果（含全部小时/全日区间与两份原件单号）",
+)
+async def list_load_results():
+    rows = await run_in_threadpool(database.list_current_load_results)
+    return [_load_result_out(row) for row in rows]
+
+
+@app.get(
+    "/load-results/{station_id}/{sample_date}",
+    response_model=LoadResultOut,
+    summary="查询单站日现行负荷结果",
+)
+async def get_load_result(station_id: str, sample_date: str):
+    record = await run_in_threadpool(
+        database.get_current_load_result, station_id, sample_date
+    )
+    if record is None:
+        raise HTTPException(404, "该站号/日期尚无负荷核算结果")
+    return _load_result_out(record)
+
+
+@app.get(
+    "/load-results/{station_id}/{sample_date}/revisions",
+    response_model=list[LoadResultRevisionOut],
+    summary="列出单站日全部历史版本（只追加，标记现行版本）",
+)
+async def list_load_revisions(station_id: str, sample_date: str):
+    revisions = await run_in_threadpool(
+        database.list_load_result_revisions, station_id, sample_date
+    )
+    if not revisions:
+        raise HTTPException(404, "该站号/日期尚无负荷核算结果")
+    current_id = revisions[-1]["id"]
+    return [_load_result_out(r, is_current=(r["id"] == current_id)) for r in revisions]
 
 
 # --------------------------------------------------------------------------- #

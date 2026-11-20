@@ -1,6 +1,7 @@
-# 河流水质站日 CSV 发布服务：两个实例共享同一卷，验证跨实例并发安全。
+# 河流水质站日 CSV 发布与负荷核算服务：两个实例共享同一卷，验证跨实例并发安全。
 # 启动：docker compose up --build
 # 实例 A 文档：http://localhost:8001/docs   实例 B 文档：http://localhost:8002/docs
+# /docs 可交互演示原件发布、Merkle 证明，以及 /load-results 负荷核算与并发重算。
 services:
   release-a:
     build: .

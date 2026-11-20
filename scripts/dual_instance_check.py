@@ -5,7 +5,8 @@
   1. 并发发布同单：恰有一个写入，另一个幂等复用，不分叉不覆盖；
   2. 并发发布异单：全部成功且序号稠密、检查点连续；
   3. 实例 A 的发布可在实例 B 下载，证明与检查点跨实例一致；
-  4. 杀掉一个实例再重启，历史检查点/证明持续有效，可继续追加。
+  4. 杀掉一个实例再重启，历史检查点/证明持续有效，可继续追加；
+  5. 负荷核算：跨实例查询一致、并发重算恰一胜一冲突、失败保留旧结果。
 
 用法：python scripts/dual_instance_check.py
 """
@@ -126,6 +127,18 @@ def get_bytes(port: int, path: str):
         return r.status, r.read()
 
 
+def post_json(port: int, path: str, payload: dict):
+    body = json.dumps(payload).encode()
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+    conn.request(
+        "POST", path, body=body, headers={"Content-Type": "application/json"}
+    )
+    resp = conn.getresponse()
+    raw = resp.read().decode()
+    conn.close()
+    return resp.status, json.loads(raw) if raw else {}
+
+
 def main() -> int:
     data_dir = tempfile.mkdtemp(prefix="wq-dual-")
     print(f"[setup] 共享 DATA_DIR={data_dir}")
@@ -211,23 +224,100 @@ def main() -> int:
             f"追加证明条目数 O(log n)={len(append['entries'])} ≤ 14",
         )
 
+        # 4b) 负荷核算：发布流量/浓度原件，跨实例核算与查询。
+        station, day = "ST-LOAD", "2026-11-20"
+        flow_csv = (
+            b"start,end,volume_m3,max_flow_m3s\n"
+            b"00:00,12:00,1800,1\n12:00,24:00,1800,1\n"
+        )
+        conc_csv = (
+            b"start,end,conc_low_mg_l,conc_high_mg_l\n00:00,24:00,2,4\n"
+        )
+        s_f, _ = post_release(PORT_A, station, day, "FLOW-1", flow_csv)
+        s_c, _ = post_release(PORT_B, station, day, "CONC-1", conc_csv)
+        check(s_f == 201 and s_c == 201, "流量/浓度原件分别在两个实例发布成功")
+
+        req = {
+            "station_id": station,
+            "sample_date": day,
+            "flow_order_no": "FLOW-1",
+            "conc_order_no": "CONC-1",
+        }
+        s1, first = post_json(PORT_A, "/load-results", req)
+        check(s1 == 201 and first["day"] == {"load_low_g": 7200.0,
+                                             "load_high_g": 14400.0},
+              f"首次核算成功且全日区间正确（HTTP {s1}）")
+        first_id = first["id"]
+        check(len(first["hours"]) == 24, "返回 24 个整点小时区间")
+
+        # 实例 B 立刻可见实例 A 的现行结果（共卷共库）。
+        s_q, seen_by_b = get_json(
+            PORT_B, f"/load-results/{station}/{day}"
+        )
+        check(s_q == 200 and seen_by_b["id"] == first_id
+              and seen_by_b["flow_order_no"] == "FLOW-1"
+              and seen_by_b["conc_order_no"] == "CONC-1",
+              "跨实例查询到同一现行编号与两份原件发布单号")
+
+        # 留空 expected_id 的重复首次提交 -> 409。
+        s_stale, stale = post_json(PORT_B, "/load-results", req)
+        check(s_stale == 409 and stale["detail"]["current_id"] == first_id,
+              "现行编号已变语义：重复首次提交返回 409 并回传现行编号")
+
+        # 并发重算：两实例同时携带同一旧编号 -> 恰一胜一冲突，只产生一个新版本。
+        req_old = {**req, "expected_id": first_id}
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            raced = list(
+                pool.map(
+                    lambda port: post_json(port, "/load-results", req_old),
+                    [PORT_A, PORT_B],
+                )
+            )
+        race_status = sorted(s for s, _ in raced)
+        check(race_status == [201, 409],
+              f"并发重算恰一成功一冲突（实际 {race_status}）")
+        _, current = get_json(PORT_A, f"/load-results/{station}/{day}")
+        check(current["id"] == first_id + 1, "并发后现行编号只前进一次")
+        _, revs = get_json(PORT_A, f"/load-results/{station}/{day}/revisions")
+        check([r["id"] for r in revs] == [first_id, first_id + 1]
+              and revs[-1]["is_current"] is True,
+              "历史版本只追加且现行标记正确")
+
+        # 缺测原件（流量只覆盖半天）-> 422 指出缺口时段，旧结果保留。
+        post_release(PORT_A, station, day, "FLOW-GAP",
+                     b"start,end,volume_m3,max_flow_m3s\n00:00,12:00,9,1\n")
+        s_bad, bad = post_json(
+            PORT_B, "/load-results",
+            {**req, "flow_order_no": "FLOW-GAP", "expected_id": first_id + 1},
+        )
+        check(s_bad == 422
+              and any("未覆盖全天" in p for p in bad["detail"]["problems"]),
+              "缺测时段被逐条指出并拒绝发布（HTTP 422）")
+        _, after_bad = get_json(PORT_A, f"/load-results/{station}/{day}")
+        check(after_bad["id"] == first_id + 1, "校验失败后旧结果原样保留")
+
         # 5) 故障转移：原实例不杀（本环境 seccomp 禁止 kill），
         #    另起一个全新进程指向同一共享卷，模拟实例重启/替换。
+        _, releases_before = get_json(PORT_A, "/releases")
+        count_before = len(releases_before)
+        _, cp_before = get_json(PORT_A, "/checkpoints/latest")
         proc_c = start_instance(PORT_C, data_dir)
         try:
             _, health = get_json(PORT_C, "/health")
             check(
-                health["status"] == "ok" and health["release_count"] == 11,
-                "新实例挂载同卷后自检通过且条数仍为 11",
+                health["status"] == "ok"
+                and health["release_count"] == count_before,
+                f"新实例挂载同卷后自检通过且条数仍为 {count_before}",
             )
             _, cp_after = get_json(PORT_C, "/checkpoints/latest")
-            check(cp_after == cp_a, "重启视角下最新检查点根摘要不变")
+            check(cp_after == cp_before, "重启视角下最新检查点根摘要不变")
             status_post, new_pub = post_release(
                 PORT_C, "ST99", "2026-11-16", "ORD-AFTER-RESTART", b"after\n"
             )
             check(
-                status_post == 201 and new_pub["release"]["id"] == 12,
-                "新实例可继续追加，新记录序号=12",
+                status_post == 201
+                and new_pub["release"]["id"] == count_before + 1,
+                f"新实例可继续追加，新记录序号={count_before + 1}",
             )
             _, proof12 = get_json(
                 PORT_B,

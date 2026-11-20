@@ -41,6 +41,25 @@ CREATE TABLE IF NOT EXISTS meta (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
 );
+
+-- 负荷核算结果：每站日一行“现行版本”，替换即插入新版本（只追加历史）。
+-- expected_id 乐观并发：提交时携带要替换的结果编号，现行编号已变 -> 409。
+CREATE TABLE IF NOT EXISTS load_results (
+    id                  INTEGER PRIMARY KEY,          -- 结果编号，全表单调递增
+    station_id          TEXT NOT NULL,
+    sample_date         TEXT NOT NULL,
+    flow_order_no       TEXT NOT NULL,
+    conc_order_no       TEXT NOT NULL,
+    flow_blob_sha256    TEXT NOT NULL,
+    conc_blob_sha256    TEXT NOT NULL,
+    hourly_json         TEXT NOT NULL,                -- 24 个整点小时区间
+    daily_json          TEXT NOT NULL,                -- 全日区间
+    created_at          TEXT NOT NULL,
+    UNIQUE(station_id, sample_date, id)               -- 同站日内编号唯一
+);
+
+CREATE INDEX IF NOT EXISTS idx_load_current
+    ON load_results(station_id, sample_date, id);
 """
 
 
@@ -50,6 +69,10 @@ def _utcnow() -> str:
 
 class ConflictError(Exception):
     """业务冲突：异输入重试或超出累计上限。"""
+
+
+class StaleRevisionError(Exception):
+    """乐观并发冲突：提交携带的要替换编号已不是现行编号。"""
 
 
 class Database:
@@ -256,6 +279,150 @@ class Database:
                 "SELECT * FROM checkpoints ORDER BY seq ASC"
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ #
+    # 负荷核算结果（每站日一行现行版本，历史只追加）
+    # ------------------------------------------------------------------ #
+    def get_current_load_result(self, station_id: str, sample_date: str):
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM load_results "
+                "WHERE station_id = ? AND sample_date = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (station_id, sample_date),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_current_load_results(self) -> list[dict]:
+        """每个站日的现行版本（各站日最大 id）。"""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT r.* FROM load_results r "
+                "JOIN (SELECT station_id, sample_date, MAX(id) AS max_id "
+                "      FROM load_results GROUP BY station_id, sample_date) m "
+                "ON r.id = m.max_id ORDER BY r.id ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_load_result_revisions(self, station_id: str, sample_date: str):
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM load_results WHERE station_id = ? AND sample_date = ? "
+                "ORDER BY id ASC",
+                (station_id, sample_date),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def save_load_result(
+        self,
+        station_id: str,
+        sample_date: str,
+        flow_order_no: str,
+        conc_order_no: str,
+        flow_blob_sha256: str,
+        conc_blob_sha256: str,
+        hourly: list[dict],
+        daily: dict,
+        expected_id: int | None,
+    ) -> dict:
+        """在串行化事务内做乐观并发检查并插入新结果版本。
+
+        * ``expected_id`` 为 None 表示首次提交（该站日不得已有结果）；
+        * 否则必须等于该站日现行编号，不一致即抛 :class:`StaleRevisionError`，
+          调用方保留旧结果、向客户端报 409。
+        """
+        for attempt in range(3):
+            try:
+                return self._save_load_result_once(
+                    station_id,
+                    sample_date,
+                    flow_order_no,
+                    conc_order_no,
+                    flow_blob_sha256,
+                    conc_blob_sha256,
+                    hourly,
+                    daily,
+                    expected_id,
+                )
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc).lower() and attempt < 2:
+                    time.sleep(0.2 * (attempt + 1))
+                    continue
+                raise
+        raise RuntimeError("unreachable")  # pragma: no cover
+
+    def _save_load_result_once(
+        self,
+        station_id,
+        sample_date,
+        flow_order_no,
+        conc_order_no,
+        flow_blob_sha256,
+        conc_blob_sha256,
+        hourly,
+        daily,
+        expected_id,
+    ) -> dict:
+        import json
+
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT * FROM load_results "
+                    "WHERE station_id = ? AND sample_date = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (station_id, sample_date),
+                ).fetchone()
+                current_id = row["id"] if row is not None else None
+                if expected_id is None:
+                    if current_id is not None:
+                        conn.rollback()
+                        raise StaleRevisionError(
+                            f"该站日已存在现行结果编号 {current_id}，"
+                            "首次提交 expected_id 须留空的前提已不成立"
+                        )
+                elif current_id != expected_id:
+                    conn.rollback()
+                    raise StaleRevisionError(
+                        f"负荷结果已被其他实例重算：期望替换编号 {expected_id}，"
+                        f"现行编号为 {current_id}"
+                    )
+
+                cursor = conn.execute(
+                    "INSERT INTO load_results(station_id, sample_date, "
+                    "flow_order_no, conc_order_no, flow_blob_sha256, "
+                    "conc_blob_sha256, hourly_json, daily_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        station_id,
+                        sample_date,
+                        flow_order_no,
+                        conc_order_no,
+                        flow_blob_sha256,
+                        conc_blob_sha256,
+                        json.dumps(hourly, ensure_ascii=False, sort_keys=True),
+                        json.dumps(daily, ensure_ascii=False, sort_keys=True),
+                        _utcnow(),
+                    ),
+                )
+                new_id = cursor.lastrowid
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        record = self.get_load_result_by_id(new_id)
+        if record is None:  # pragma: no cover
+            raise RuntimeError("负荷结果插入后无法回读")
+        return record
+
+    def get_load_result_by_id(self, result_id: int):
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM load_results WHERE id = ?", (result_id,)
+            ).fetchone()
+            return dict(row) if row else None
 
     # ------------------------------------------------------------------ #
     # 启动自检：不得带着缺件记录对外服务
